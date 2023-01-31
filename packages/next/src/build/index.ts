@@ -85,7 +85,7 @@ import { generateBuildId } from './generate-build-id'
 import { isWriteable } from './is-writeable'
 import * as Log from './output/log'
 import createSpinner from './spinner'
-import { trace, flushAllTraces, setGlobal, Span } from '../trace'
+import { trace, flushAllTraces, setGlobal } from '../trace'
 import {
   detectConflictingPaths,
   computeFromManifest,
@@ -103,7 +103,6 @@ import { normalizeLocalePath } from '../shared/lib/i18n/normalize-locale-path'
 import { NextConfigComplete } from '../server/config-shared'
 import isError, { NextError } from '../lib/is-error'
 import { isEdgeRuntime } from '../lib/is-edge-runtime'
-import { TelemetryPlugin } from './webpack/plugins/telemetry-plugin'
 import { MiddlewareManifest } from './webpack/plugins/middleware-plugin'
 import { recursiveCopy } from '../lib/recursive-copy'
 import { recursiveReadDir } from '../lib/recursive-readdir'
@@ -121,6 +120,7 @@ import { normalizeAppPath } from '../shared/lib/router/utils/app-paths'
 import { AppBuildManifest } from './webpack/plugins/app-build-manifest-plugin'
 import { RSC, RSC_VARY_HEADER } from '../client/components/app-router-headers'
 import { webpackBuild } from './webpack-build'
+import { NextBuildContext } from './build-context'
 
 export type SsgRoute = {
   initialRevalidateSeconds: number | false
@@ -142,13 +142,6 @@ export type PrerenderManifest = {
   notFoundRoutes: string[]
   preview: __ApiPreviewProps
 }
-
-export const NextBuildContext: Partial<{
-  telemetryPlugin: TelemetryPlugin
-  buildSpinner: any
-  nextBuildSpan: Span
-  dir: string
-}> = {}
 
 /**
  * typescript will be loaded in "next/lib/verifyTypeScriptSetup" and
@@ -251,33 +244,40 @@ export default async function build(
     const nextBuildSpan = trace('next-build', undefined, {
       version: process.env.__NEXT_VERSION as string,
     })
+
     NextBuildContext.nextBuildSpan = nextBuildSpan
     NextBuildContext.dir = dir
+    NextBuildContext.appDirOnly = appDirOnly
+    NextBuildContext.reactProductionProfiling = reactProductionProfiling
+    NextBuildContext.noMangling = noMangling
 
     const buildResult = await nextBuildSpan.traceAsyncFn(async () => {
       // attempt to load global env values so they are available in next.config.js
       const { loadedEnvFiles } = nextBuildSpan
         .traceChild('load-dotenv')
         .traceFn(() => loadEnvConfig(dir, false, Log))
+      NextBuildContext.loadedEnvFiles = loadedEnvFiles
 
       const config: NextConfigComplete = await nextBuildSpan
         .traceChild('load-next-config')
         .traceAsyncFn(() => loadConfig(PHASE_PRODUCTION_BUILD, dir))
+      NextBuildContext.config = config
 
       const distDir = path.join(dir, config.distDir)
       setGlobal('phase', PHASE_PRODUCTION_BUILD)
       setGlobal('distDir', distDir)
 
-      const { target } = config
       const buildId: string = await nextBuildSpan
         .traceChild('generate-buildid')
         .traceAsyncFn(() => generateBuildId(config.generateBuildId, nanoid))
+      NextBuildContext.buildId = buildId
 
       const customRoutes: CustomRoutes = await nextBuildSpan
         .traceChild('load-custom-routes')
         .traceAsyncFn(() => loadCustomRoutes(config))
 
       const { headers, rewrites, redirects } = customRoutes
+      NextBuildContext.rewrites = rewrites
 
       const cacheDir = path.join(distDir, 'cache')
       if (ciEnvironment.isCI && !ciEnvironment.hasNextSupport) {
@@ -324,6 +324,9 @@ export default async function build(
         })
 
       const { pagesDir, appDir } = findPagesDir(dir, isAppDirEnabled)
+      NextBuildContext.pagesDir = pagesDir
+      NextBuildContext.appDir = appDir
+
       const isSrcDir = path
         .relative(dir, pagesDir || appDir || '')
         .startsWith('src')
@@ -516,6 +519,7 @@ export default async function build(
         previewModeSigningKey: crypto.randomBytes(32).toString('hex'),
         previewModeEncryptionKey: crypto.randomBytes(32).toString('hex'),
       }
+      NextBuildContext.previewProps = previewProps
 
       const mappedPages = nextBuildSpan
         .traceChild('create-pages-mapping')
@@ -528,6 +532,7 @@ export default async function build(
             pagesDir,
           })
         )
+      NextBuildContext.mappedPages = mappedPages
 
       let mappedAppPages: { [page: string]: string } | undefined
       let denormalizedAppPages: string[] | undefined
@@ -544,6 +549,7 @@ export default async function build(
               pagesDir: pagesDir,
             })
           )
+        NextBuildContext.mappedAppPages = mappedAppPages
       }
 
       let mappedRootPaths: { [page: string]: string } = {}
@@ -556,6 +562,7 @@ export default async function build(
           pagesDir: pagesDir,
         })
       }
+      NextBuildContext.mappedRootPaths = mappedRootPaths
 
       const pagesPageKeys = Object.keys(mappedPages)
 
@@ -919,32 +926,7 @@ export default async function build(
           ignore: [] as string[],
         }))
 
-      const webpackBuildDuration = await webpackBuild(
-        {
-          buildId,
-          config,
-          pagesDir,
-          reactProductionProfiling,
-          rewrites,
-          target,
-          appDir,
-          noMangling,
-        },
-        {
-          buildId,
-          config,
-          envFiles: loadedEnvFiles,
-          isDev: false,
-          pages: mappedPages,
-          pagesDir,
-          previewMode: previewProps,
-          rootDir: dir,
-          rootPaths: mappedRootPaths,
-          appDir,
-          appPaths: mappedAppPages,
-          pageExtensions: config.pageExtensions,
-        }
-      )
+      const webpackBuildDuration = await webpackBuild()
 
       telemetry.record(
         eventBuildCompleted(pagesPaths, {
